@@ -1,0 +1,24 @@
+{
+    "url": "GANTI_DENGAN_URL_WEBSITE",
+    "headless": false,
+    "timeout_seconds": 30,
+    "interval_minutes": 60,
+    "login": {
+        "enabled": false,
+        "username_selector": "",
+        "password_selector": "",
+        "submit_selector": "",
+        "username": "",
+        "password": ""
+    },
+    "claim": {
+        "button_selector": "GANTI_DENGAN_SELECTOR_TOMBOL_CLAIM",
+        "success_text": "success",
+        "max_attempts": 3,
+        "retry_delay_seconds": 10
+    },
+    "notification": {
+        "enabled": true,
+        "log_file": "claims.log"
+    }
+}
