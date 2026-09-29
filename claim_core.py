@@ -6,6 +6,7 @@
 # ============================================================
 
 import asyncio
+import sys
 import time
 from collections import OrderedDict
 from datetime import datetime, timedelta
@@ -31,6 +32,7 @@ CLAIM_WINDOW = 120       # detik polling setelah jam target
 HEADLESS = False         # WAJIB False: browser harus kelihatan & tidak ditutup
 KEEP_OPEN_AFTER = 900    # browser dibiarkan terbuka 15 menit setelah claim
 LOGIN_PARALLEL = 4       # max login bersamaan
+MAX_ACCOUNTS = 30        # limit akun
 # =================================================
 
 SESSION_DIR.mkdir(exist_ok=True)
@@ -38,14 +40,28 @@ SESSION_DIR.mkdir(exist_ok=True)
 # Log tail global (dibaca oleh bot untuk /log)
 LOG_LINES = []
 LOG_MAX = 800
+LOG_FILE = BASE_DIR / "bot_log.txt"
 
 
 def log(msg):
     line = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
-    print(line, flush=True)
+    if sys.stdout is not None:
+        print(line, flush=True)
     LOG_LINES.append(line)
     if len(LOG_LINES) > LOG_MAX:
         del LOG_LINES[: len(LOG_LINES) - LOG_MAX]
+    try:
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+    # live listeners (bot telegram) — jalankan di loop masing-masing
+    if getattr(JM, "listeners", None):
+        for fn in list(JM.listeners):
+            try:
+                fn(line)
+            except Exception:
+                pass
 
 
 def tail_log(n=30):
@@ -79,6 +95,8 @@ def save_accounts(accounts):
 
 def add_account(email, password):
     accounts = load_accounts()
+    if email not in accounts and len(accounts) >= MAX_ACCOUNTS:
+        return f"⛔ LIMIT! Maksimal {MAX_ACCOUNTS} akun (sekarang {len(accounts)})"
     if email in accounts:
         accounts[email] = password  # update password
         save_accounts(accounts)
@@ -490,6 +508,15 @@ class JobManager:
         self.results = {}          # email -> "BERHASIL"/"GAGAL"/"ERROR: ..."
         self.standby_pages = {}    # email -> page (browser standby terbuka)
         self.lock = asyncio.Lock()
+        self.listeners = []        # daftar async fn(line) untuk live log
+
+    def add_listener(self, fn):
+        if fn not in self.listeners:
+            self.listeners.append(fn)
+
+    def remove_listener(self, fn):
+        if fn in self.listeners:
+            self.listeners.remove(fn)
 
     @property
     def busy(self):
@@ -750,7 +777,7 @@ class JobManager:
         WAR_STATE["target"] = None
         log("[+] WAR selesai. Semua browser dibiarkan TERBUKA.")
 
-    async def start_war(self):
+    async def start_war(self, auto=False):
         if self.busy:
             return f"⛔ Masih ada job jalan: {self.job_desc()}. /stop dulu."
         self.stopping = False
@@ -762,7 +789,8 @@ class JobManager:
                              microsecond=0)
         if target <= now:
             target += timedelta(days=1)
-        return (f"🚀 WAR TERJADWAL AKTIF!\n"
+        label = "⏰ AUTO-WAR" if auto else "🚀 WAR"
+        return (f"{label} TERJADWAL AKTIF!\n"
                 f"  Login : {LOGIN_HOUR:02d}:{LOGIN_MINUTE:02d}\n"
                 f"  GAS   : {target.strftime('%d %b %H:%M:%S')}\n"
                 f"Cek: /status • /log • Batal: /stop")
@@ -789,3 +817,58 @@ class JobManager:
 
 WAR_STATE = {"target": None}
 JM = JobManager()
+
+
+# ================== AUTO-WAR DAILY SCHEDULER ==================
+
+async def auto_war_loop(notify=None):
+    """Setiap hari jam 22:40 otomatis mulai WAR (login all -> standby ->
+    gas 23:00). notify = async fn(text) untuk kabari via Telegram."""
+    while True:
+        now = datetime.now()
+        login_t = now.replace(hour=LOGIN_HOUR, minute=LOGIN_MINUTE,
+                              second=0, microsecond=0)
+        if now >= login_t:
+            # Sudah lewat 22:40 hari ini:
+            #  - kalau WAR belum jalan dan masih sebelum 23:00, gas sekalian
+            #  - kalau sudah lewat 23:00, tunggu besok
+            target_t = now.replace(hour=CLAIM_HOUR, minute=CLAIM_MINUTE,
+                                   second=0, microsecond=0)
+            if now < target_t:
+                login_t = now  # telat sedikit -> langsung mulai sekarang
+            else:
+                login_t += timedelta(days=1)
+        tunggu = (login_t - now).total_seconds()
+        log(f"[AUTO-WAR] WAR berikutnya: {login_t.strftime('%d %b %H:%M')} "
+            f"({int(tunggu//3600)}j {int(tunggu%3600//60)}m lagi)")
+        # tidur sampai jam login (bangun tiap 30 dtk biar responsif)
+        while True:
+            now = datetime.now()
+            if now >= login_t:
+                break
+            sisa = (login_t - now).total_seconds()
+            await asyncio.sleep(min(30, max(1, sisa)))
+
+        if load_accounts():
+            if notify:
+                try:
+                    await notify("⏰ AUTO-WAR: jam 22:40 — login semua akun "
+                                 "dimulai otomatis!")
+                except Exception:
+                    pass
+            log("[AUTO-WAR] memulai WAR otomatis")
+            try:
+                await JM.start_war(auto=True)
+                if JM.job_task:
+                    await JM.job_task
+                if notify:
+                    try:
+                        await notify("🏁 AUTO-WAR selesai! Cek /status "
+                                     "untuk hasil, /shot untuk bukti.")
+                    except Exception:
+                        pass
+            except Exception as e:
+                log(f"[AUTO-WAR] error: {type(e).__name__}: {e}")
+        else:
+            log("[AUTO-WAR] dilewati: tidak ada akun")
+            await asyncio.sleep(60)
