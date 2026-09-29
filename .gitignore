@@ -11,3 +11,6 @@ tencent_session.json
 ClaimApp.exe
 _proc_check.txt
 tui_dbg.txt
+token.txt
+getid.txt
+allowed_id.txt
