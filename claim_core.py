@@ -32,7 +32,7 @@ CLAIM_WINDOW = 120       # detik polling setelah jam target
 HEADLESS = False         # WAJIB False: browser harus kelihatan & tidak ditutup
 KEEP_OPEN_AFTER = 900    # browser dibiarkan terbuka 15 menit setelah claim
 LOGIN_PARALLEL = 4       # max login bersamaan
-MAX_ACCOUNTS = 30        # limit akun
+MAX_ACCOUNTS = 50        # limit akun
 # =================================================
 
 SESSION_DIR.mkdir(exist_ok=True)
@@ -196,9 +196,49 @@ async def try_click(page, selectors, desc, timeout=2500):
 
 # ================== LOGIN ==================
 
-async def login_one(pw, email, password):
-    """Login 1 akun di browser sendiri, simpan session. Return (ok, pesan)."""
+async def check_session_valid(page):
+    """Cek apakah browser (dengan cookie) masih login di FreeTier."""
+    await page.goto(FREE_TIER_URL, wait_until="domcontentloaded")
+    await page.wait_for_timeout(2000)
+    await dismiss_cookie_dialog(page)
+    content = await page.content()
+    return not ("Sign Up Free" in content or "Log in with email" in content)
+
+
+async def login_one(pw, email, password, keep_open_if_valid=True):
+    """LOGIN PINTAR 1 akun:
+    1. Session/cookie lama masih valid -> PAKAI ITU, TANPA login ulang.
+       Browser dibiarkan terbuka & page-nya dikembalikan (siap standby).
+       Return (True, 'session valid — pakai cookie lama', page)
+    2. Session tidak ada / expired -> login baru, simpan session.
+       Return (ok, pesan, None)
+    """
     sp = session_path(email)
+
+    # ---------- 1) COBA COOKIE LAMA DULU ----------
+    if sp.exists():
+        browser = await pw.chromium.launch(headless=HEADLESS)
+        ctx = await browser.new_context(storage_state=str(sp))
+        page = await ctx.new_page()
+        page._email = email
+        try:
+            if await check_session_valid(page):
+                log(f"    [{email}] session VALID -> pakai cookie lama "
+                    f"(tanpa login ulang)")
+                if keep_open_if_valid:
+                    return True, "session valid — pakai cookie lama", page
+                await browser.close()
+                return True, "session valid — pakai cookie lama", None
+            log(f"    [{email}] session expired -> login ulang...")
+        except Exception as e:
+            log(f"    [{email}] cek cookie error ({type(e).__name__}) "
+                f"-> login ulang...")
+        try:
+            await browser.close()
+        except Exception:
+            pass
+
+    # ---------- 2) LOGIN BARU ----------
     browser = await pw.chromium.launch(headless=HEADLESS)
     ctx = await browser.new_context()
     page = await ctx.new_page()
@@ -226,15 +266,15 @@ async def login_one(pw, email, password):
         ok = not ("Sign Up Free" in content or "Log in with email" in content)
         if ok:
             await ctx.storage_state(path=str(sp))
-            log(f"    [{email}] session tersimpan -> {sp.name}")
-            return True, "login OK, session tersimpan"
+            log(f"    [{email}] session baru tersimpan -> {sp.name}")
+            return True, "login OK, session tersimpan", None
         log(f"    [{email}] LOGIN GAGAL (captcha / password salah?)")
         await page.screenshot(
             path=str(BASE_DIR / f"loginfail_{email.split('@')[0]}.png"),
             full_page=True)
-        return False, "LOGIN GAGAL — cek screenshot loginfail_*.png (captcha?)"
+        return False, "LOGIN GAGAL — cek screenshot loginfail_*.png (captcha?)", None
     except Exception as e:
-        return False, f"error: {type(e).__name__}: {e}"
+        return False, f"error: {type(e).__name__}: {e}", None
     finally:
         # Browser login BOLEH ditutup (session sudah tersimpan di json)
         try:
@@ -548,7 +588,7 @@ class JobManager:
                 pass
             self.pw = None
 
-    # ---------- LOGIN ALL ----------
+    # ---------- LOGIN ALL (PINTAR: cookie valid = tanpa login ulang) ----------
 
     async def login_all(self):
         accounts = load_accounts()
@@ -557,25 +597,41 @@ class JobManager:
         pw = await self.ensure_pw()
         sem = asyncio.Semaphore(LOGIN_PARALLEL)
         hasil = {}
+        valid_pages = {}
 
         async def one(e, p):
             async with sem:
-                ok, msg = await login_one(pw, e, p)
+                ok, msg, page = await login_one(pw, e, p,
+                                                keep_open_if_valid=True)
                 hasil[e] = msg
+                if page is not None:
+                    valid_pages[e] = page  # browser valid -> langsung standby
 
         log(f"[LOGIN-ALL] {len(accounts)} akun (max {LOGIN_PARALLEL} paralel)")
         await asyncio.gather(*[one(e, p) for e, p in accounts.items()])
-        ok_n = sum(1 for m in hasil.values() if m.startswith("login OK"))
-        baris = [f"Login selesai: {ok_n}/{len(accounts)} sukses"]
+        # Browser yang sudah valid langsung jadi STANDBY (tidak ditutup)
+        self.standby_pages.update(valid_pages)
+        n_valid = sum(1 for m in hasil.values() if m.startswith("session valid"))
+        n_new = sum(1 for m in hasil.values() if m.startswith("login OK"))
+        n_fail = len(hasil) - n_valid - n_new
+        baris = [f"Login selesai: {len(accounts)} akun → "
+                 f"♻️ {n_valid} pakai cookie lama • 🔑 {n_new} login baru • "
+                 f"✗ {n_fail} gagal"]
         for e, m in hasil.items():
-            tanda = "✓" if m.startswith("login OK") else "✗"
+            if m.startswith("session valid"):
+                tanda = "♻️"
+            elif m.startswith("login OK"):
+                tanda = "🔑"
+            else:
+                tanda = "✗"
             baris.append(f"  {tanda} {e} — {m}")
+        baris.append(f"\nBrowser standby terbuka: {len(self.standby_pages)}")
         return "\n".join(baris)
 
     # ---------- GAS SEMUA AKUN (mode instant: test/gas) ----------
 
     async def _gas_worker(self, pw, email, password, mode):
-        """1 akun = 1 browser. Session invalid -> login dulu di browser ini."""
+        """1 akun = 1 browser. Session valid -> pakai; invalid -> login."""
         sp = session_path(email)
         browser = await pw.chromium.launch(headless=HEADLESS)
         ctx = await browser.new_context(
@@ -583,17 +639,13 @@ class JobManager:
         page = await ctx.new_page()
         page._email = email
         try:
-            await page.goto(FREE_TIER_URL, wait_until="domcontentloaded")
-            await page.wait_for_timeout(2000)
-            await dismiss_cookie_dialog(page)
-            content = await page.content()
-            if "Sign Up Free" in content or "Log in with email" in content:
+            if not await check_session_valid(page):
                 log(f"    [{email}] session invalid -> login ulang...")
-                ok, msg = await login_one(pw, email, password)
+                ok, msg, _ = await login_one(pw, email, password,
+                                             keep_open_if_valid=False)
                 if not ok:
                     self.results[email] = f"✗ {msg}"
                     return False
-                # context baru dengan session baru
                 await ctx.close()
                 try:
                     await browser.close()
@@ -692,29 +744,33 @@ class JobManager:
             log("[WAR] dihentikan sebelum login")
             return
 
-        # 2) Login semua akun (paralel terbatas)
-        log(f"[+] JAM {login_t.strftime('%H:%M')} -> LOGIN SEMUA AKUN")
+        # 2) Login semua akun (pintar: cookie valid = pakai langsung)
+        log(f"[+] JAM {login_t.strftime('%H:%M')} -> LOGIN PINTAR SEMUA AKUN")
         sem = asyncio.Semaphore(LOGIN_PARALLEL)
         hasil = {}
+        self.standby_pages = {}
 
         async def ltask(e, p):
             async with sem:
-                ok, msg = await login_one(pw, e, p)
+                ok, msg, page = await login_one(pw, e, p,
+                                                keep_open_if_valid=True)
                 hasil[e] = (ok, msg)
+                if page is not None:
+                    # cookie valid -> browser sudah kebuka & login -> STANDBY
+                    self.standby_pages[e] = page
+                    log(f"    [{e}] browser standby (dari cookie valid)")
 
         await asyncio.gather(*[ltask(e, p) for e, p in accounts.items()])
 
-        # 3) Buka browser standby TERBUKA sampai jam gas
+        # 3) Buka browser standby utk akun yang login BARU (belum punya page)
         log("[+] Buka browser standby (tidak ditutup)")
-        self.standby_pages = {}
+        baru = [e for e in accounts if e not in self.standby_pages
+                and session_path(e).exists()]
 
         async def open_standby(e):
-            if self.stopping:
+            if self.stopping or e in self.standby_pages:
                 return
             sp = session_path(e)
-            if not sp.exists():
-                log(f"    [{e}] login gagal tadi, skip standby")
-                return
             try:
                 browser = await pw.chromium.launch(headless=HEADLESS)
                 ctx = await browser.new_context(storage_state=str(sp))
@@ -728,7 +784,11 @@ class JobManager:
             except Exception as ex:
                 log(f"    [{e}] standby error: {ex}")
 
-        await asyncio.gather(*[open_standby(e) for e in accounts])
+        await asyncio.gather(*[open_standby(e) for e in baru])
+        n_valid = sum(1 for _, m in hasil.values()
+                      if m.startswith("session valid"))
+        log(f"[+] Standby: {len(self.standby_pages)} browser "
+            f"(♻️ {n_valid} dari cookie valid, 🔑 {len(baru)} login baru)")
 
         # 4) Tunggu H-8dtk -> refresh final -> tepat 23:00:00 GAS
         while (time.time() < target_t.timestamp() - FINAL_REFRESH_LEAD
