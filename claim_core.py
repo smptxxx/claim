@@ -361,6 +361,106 @@ JS_CLICK_CARD = ("(idx) => { const b = window.__gs[idx]; "
                  "b.scrollIntoView({block:'center'}); b.click(); }")
 
 
+# ================== WAR PHASE FUNCTIONS (bareng-bareng, JS murni) =========
+
+async def war_click_get_started(page):
+    """FASE Get Started: polling JS 30ms, langsung klik saat kartu muncul.
+    Return True kalau klik sukses ATAU sudah pernah di-claim (done)."""
+    email = page._email
+    try:
+        await page.reload(wait_until="commit")
+    except Exception:
+        pass
+    deadline = time.time() + CLAIM_WINDOW
+    last_reload = 0.0
+    sold_count = 0
+    while time.time() < deadline:
+        try:
+            res = await page.evaluate(JS_WAR_CLICK, "lighthouse")
+            if res == "clicked":
+                log(f"    [{email}] GET STARTED DIKLIK!")
+                # tunggu dialog Buy Now sebentar (max 1.2s)
+                try:
+                    await page.wait_for_selector(
+                        'button:has-text("Buy Now"), '
+                        'button:has-text("立即购买")', timeout=1200)
+                    return True
+                except Exception:
+                    await asyncio.sleep(0.3)
+                    continue
+            if (res in ("soldout", "disabled")
+                    and time.time() - last_reload > 2.5):
+                sold_count += 1
+                if sold_count <= 6:
+                    log(f"    [{email}] SOLD OUT -> reload cari stok #{sold_count}")
+                try:
+                    await page.reload(wait_until="domcontentloaded")
+                except Exception:
+                    pass
+                last_reload = time.time()
+        except Exception:
+            pass
+        await asyncio.sleep(0.03)
+    log(f"    [{email}] window Get Started habis ({CLAIM_WINDOW}s)")
+    return False
+
+
+async def war_click_buy_now(page):
+    """FASE Buy Now: tunggu dialog (max 8s), klik JS instan begitu muncul."""
+    email = page._email
+    try:
+        await page.wait_for_selector(
+            'button:has-text("Buy Now"), button:has-text("立即购买")',
+            timeout=8000)
+    except Exception:
+        return False
+    await page.wait_for_timeout(200)
+    try:
+        ok = await page.evaluate(
+            """() => { const b = [...document.querySelectorAll('button')]
+                       .find(x => /buy now|立即购买/i.test(x.textContent || ''));
+                 if (b) { b.click(); return true; } return false; }""")
+    except Exception:
+        ok = False
+    if not ok:
+        ok = await try_click(page, [
+            'button:has-text("Buy Now")', 'button:has-text("立即购买")',
+        ], "Buy Now", timeout=1500)
+    if ok:
+        log(f"    [{email}] >>> BUY NOW TERKLIK = SUKSES! <<<")
+    return ok
+
+
+async def war_pay_confirm(page):
+    """FASE Pay Now + Confirm (best-effort, cepat, tanpa retry panjang)."""
+    email = page._email
+    await page.wait_for_timeout(1000)
+    await dismiss_busy_popup(page)
+    try:
+        await page.wait_for_url(
+            lambda u: ("intlprepay" in u.lower()) or ("order" in u.lower()),
+            timeout=6000)
+        log(f"    [{email}] di halaman order")
+    except Exception:
+        pass
+    await try_click(page, [
+        'button:has-text("立即支付")', 'button:has-text("Pay Now")',
+    ], "Pay Now", timeout=2000)
+    await page.wait_for_timeout(1000)
+    await dismiss_busy_popup(page)
+    await try_click(page, [
+        'button:has-text("确认支付")', 'button:has-text("Confirm")',
+    ], "Confirm Payment", timeout=2000)
+    await page.wait_for_timeout(2000)
+    try:
+        await page.screenshot(
+            path=str(BASE_DIR /
+                     f"claim_{email.split('@')[0]}_lighthouse.png"),
+            full_page=True)
+    except Exception:
+        pass
+
+
 async def claim_product(page, mode, target_time=None):
     """Alur claim 1 akun. target_time=None -> langsung gas sekarang.
     Return True kalau Get Started + Buy Now terklik."""
@@ -812,14 +912,32 @@ class JobManager:
 
         await asyncio.gather(*[refresh(e) for e in list(self.standby_pages)])
 
+        # Spin presisi sampai TEPAT jam target (23:00:00.000)
         while time.time() < target_t.timestamp() and not self.stopping:
             await asyncio.sleep(0.02)
         if self.stopping:
             log("[WAR] dihentikan tepat sebelum gas")
             return
-        log(f">>> JAM {target_t.strftime('%H:%M:%S')}! GAS SEMUA AKUN! <<<")
 
-        # 5) Gas paralel di browser standby yang SAMA (tanpa buka baru)
+        # ===== 5) FASE A — REFRESH BARENG (23:00:00) =====
+        # Semua browser refresh DALAM SATU putaran asyncio.gather
+        # supaya timing-nya bareng-bareng.
+        log(f">>> JAM {target_t.strftime('%H:%M:%S')}! REFRESH BARENG <<<")
+
+        async def sync_refresh(e):
+            page = self.standby_pages.get(e)
+            if not page:
+                return
+            try:
+                await page.reload(wait_until="commit")
+            except Exception:
+                pass
+
+        await asyncio.gather(*[sync_refresh(e)
+                               for e in list(self.standby_pages)])
+
+        # ===== 6) FASE B — GAS BARENG: Get Started SEMUA AKUN paralel =====
+        log(">>> GET STARTED BARENG (polling 50ms, paralel penuh) <<<")
         self.results = {}
 
         async def gas(e):
@@ -828,14 +946,55 @@ class JobManager:
                 self.results[e] = "✗ tidak ada browser standby"
                 return
             try:
-                ok = await claim_product(page, "lighthouse")
-                self.results[e] = "✓ BERHASIL" if ok else "✗ GAGAL"
+                ok = await war_click_get_started(page)
+                self.results[e] = "✓ GET STARTED" if ok else "✗ GAGAL"
             except Exception as ex:
                 self.results[e] = f"✗ ERROR: {type(ex).__name__}: {ex}"
 
         await asyncio.gather(*[gas(e) for e in accounts])
+        log(f"[+] Get Started fase selesai: "
+            f"{sum(1 for v in self.results.values() if v.startswith('✓'))}"
+            f"/{len(accounts)}")
+
+        # ===== 7) FASE C — BUY NOW BARENG (untuk yang dapat dialog) =====
+        log(">>> BUY NOW BARENG <<<")
+
+        async def buy(e):
+            page = self.standby_pages.get(e)
+            if not page:
+                return
+            try:
+                ok = await war_click_buy_now(page)
+                if ok:
+                    self.results[e] = "✓ BERHASIL (Buy Now terklik)"
+                elif self.results.get(e, "").startswith("✗"):
+                    pass  # tetap gagal
+                else:
+                    self.results[e] = "✗ dialog Buy Now tidak muncul"
+            except Exception as ex:
+                self.results[e] = f"✗ ERROR buy: {type(ex).__name__}: {ex}"
+
+        await asyncio.gather(*[buy(e) for e in accounts])
+        log(f"[+] Buy Now fase selesai: "
+            f"{sum(1 for v in self.results.values() if v.startswith('✓'))}"
+            f"/{len(accounts)}")
+
+        # ===== 8) FASE D — PAY NOW + CONFIRM BARENG (best-effort cepat) ====
+        log(">>> PAY NOW + CONFIRM BARENG <<<")
+
+        async def pay(e):
+            page = self.standby_pages.get(e)
+            if not page:
+                return
+            try:
+                await war_pay_confirm(page)
+            except Exception as ex:
+                log(f"    [{e}] pay error: {type(ex).__name__}: {ex}")
+
+        await asyncio.gather(*[pay(e) for e in accounts])
         WAR_STATE["target"] = None
-        log("[+] WAR selesai. Semua browser dibiarkan TERBUKA.")
+        log("[+] WAR selesai — semua fase bareng tuntas. "
+            "Browser dibiarkan TERBUKA.")
 
     async def start_war(self, auto=False):
         if self.busy:
