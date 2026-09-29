@@ -1,0 +1,13 @@
+__pycache__/
+build/
+dist/
+*.pyc
+sessions/
+accounts.txt
+*_session.json
+tencent_session.json
+*.log
+*.png
+ClaimApp.exe
+_proc_check.txt
+tui_dbg.txt
